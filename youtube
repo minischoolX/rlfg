@@ -1,0 +1,229 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+# Changed: red function now outputs to stderr
+green() {
+    echo -e "\033[0;32m$1\033[0m"
+}
+
+red() {
+    echo -e "\033[0;31m$1\033[0m" >&2 # Redirect output to stderr
+}
+
+yellow() {
+    echo -e "\033[0;33m$1\033[0m"
+}
+
+# Check storage permission
+if ! [ -d "$HOME/storage/downloads" ]; then
+    termux-setup-storage
+fi
+
+# --- Prompt with validation ---
+read_input() {
+    local prompt="$1"
+    local validation_type="$2"
+    local default_value="$3"
+    local user_input # Renamed var to user_input for clarity
+
+    while true; do
+        read -p "$prompt" user_input
+
+        # Handle empty input with default value
+        if [ -z "$user_input" ] && [ -n "$default_value" ]; then
+            echo "$default_value" # This is the only successful exit path for default
+            return
+        fi
+
+        # Apply specific validation based on type
+        case "$validation_type" in
+            "non_empty")
+                if [ -n "$user_input" ]; then
+                    echo "$user_input" # Successful exit
+                    return
+                else
+                    red "Maherbani kari ne Jawab dakhal karo!"
+                fi
+                ;;
+            "whole_number")
+                if [[ "$user_input" =~ ^[0-9]+$ ]] && [ "$user_input" -ge 0 ]; then
+                    echo "$user_input" # Successful exit
+                    return
+                else
+                    red "Maherbani kari ne ketla movie k bhag che eno number nakho!"
+                fi
+                ;;
+            "time_format")
+                # Normalize to colon format for easier regex matching
+                local normalized_time=$(echo "$user_input" | tr '.' ':')
+                # Regex for H:M:S, HH:MM:SS, H:M:SS, etc. (flexible single or double digits)
+                if [[ "$normalized_time" =~ ^([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2})$ ]]; then
+                    local h=${BASH_REMATCH[1]}
+                    local m=${BASH_REMATCH[2]}
+                    local s=${BASH_REMATCH[3]}
+
+                    if (( h >= 0 && m >= 0 && m < 60 && s >= 0 && s < 60 )); then
+                        printf "%02d:%02d:%02d\n" "$h" "$m" "$s" # Successful exit
+                        return
+                    else
+                        red "Maherbani kari samay HH.MM.SS format ma nakho!"
+                    fi
+                else
+                    red "Maherbani kari samay HH.MM.SS format ma nakho!"
+                fi
+                ;;
+            *) # No specific validation, just return the input
+                echo "$user_input" # Successful exit
+                return
+                ;;
+        esac
+        # If we reach here, validation failed, and the loop continues
+    done
+}
+
+# --- Collect inputs ---
+MOVIENAME=$(read_input "Movie nu nam: " "non_empty")
+NORMALIZED_NAME=$(echo "$MOVIENAME" | sed 's/\b\(.\)/\u\1/g' | tr ' ' '_')
+
+YTURL=$(read_input "YouTube link: " "non_empty")
+
+# --- Fetch canonical URL and video ID in background ---
+# Ensure stderr from yt-dlp is suppressed, not captured by exec 3< or 4<
+exec 3< <(yt-dlp --print "%(webpage_url)s" "$YTURL" 2>/dev/null)
+exec 4< <(yt-dlp --print "%(id)s" "$YTURL" 2>/dev/null)
+
+# --- Collect clip information ---
+CLIPS=$(read_input "    ketla video banavso?: " "whole_number" "1")
+
+declare -a CHUNKS_STARTS
+declare -a CHUNKS_ENDS
+declare -a CHUNKS_PER_CLIP
+declare -a CLIP_SUMMARY_LINES # To store summary for each clip
+
+for ((clip=1; clip<=CLIPS; clip++)); do
+    CHUNKS=$(read_input "        Video $clip? ma ketla katka che?: " "whole_number" "1")
+    CHUNKS_PER_CLIP+=("$CHUNKS")
+
+    current_clip_summary=" "
+    for ((chunk=1; chunk<=CHUNKS; chunk++)); do
+        START_TIME=$(read_input "            Start time (video $clip bhag $chunk) : " "time_format")
+        END_TIME=$(read_input "            End time (video $clip bhag $chunk) : " "time_format")
+        CHUNKS_STARTS+=("$START_TIME")
+        CHUNKS_ENDS+=("$END_TIME")
+
+        if [ "$chunk" -gt 1 ]; then
+            current_clip_summary+=" + "
+        fi
+        current_clip_summary+="($START_TIME - $END_TIME)"
+    done
+    CLIP_SUMMARY_LINES+=("$current_clip_summary")
+done
+
+# --- Read canonical URL and video ID ---
+read -r CANONICAL_URL <&3
+read -r VIDEO_ID <&4
+exec 3<&-
+exec 4<&-
+
+# --- Confirmation Summary ---
+yellow "--- Input Summary ---"
+yellow "Movie Name: $MOVIENAME"
+yellow "YouTube URL: $YTURL"
+yellow "Number of Videos to create: $CLIPS"
+for ((i=0; i<CLIPS; i++)); do
+    # Get the number of chunks for the current clip
+    current_chunks=${CHUNKS_PER_CLIP[i]}
+    yellow "Video $((i+1)): [$current_chunks] ${CLIP_SUMMARY_LINES[i]}"
+done
+yellow "--- End of Summary ---"
+
+read -p "Do you want to proceed with these inputs? (y/N): " CONFIRM_PROCEED
+CONFIRM_PROCEED=${CONFIRM_PROCEED:-y} # Default to 'y' if empty
+
+if [[ "$CONFIRM_PROCEED" =~ ^[Nn]$ ]]; then
+    red "Operation cancelled by user."
+    exit 1
+fi
+
+# --- Directories ---
+PROJECT_DIR="$HOME/storage/downloads/yt-project"
+STREAM_DIR="$PROJECT_DIR/stream"
+MOVIES_DIR="$PROJECT_DIR/Movies"
+MOVIE_DIR="$MOVIES_DIR/$NORMALIZED_NAME"
+TMP_DIR="$MOVIE_DIR/tmp"
+
+mkdir -p "$STREAM_DIR"
+mkdir -p "$MOVIE_DIR"
+
+if [ -d "$TMP_DIR" ]; then
+    rm -rf "$TMP_DIR"
+fi
+mkdir -p "$TMP_DIR"
+
+# --- Check for existing stream ---
+USE_EXISTING_STREAM=false
+for FILE in "$STREAM_DIR"/*; do
+    BASENAME=$(basename "$FILE")
+    # Using `[[ ... ]]` for pattern matching to avoid issues with special characters in VIDEO_ID if any.
+    if [[ "$BASENAME" == *"(${VIDEO_ID})"* ]]; then
+        USE_EXISTING_STREAM=true
+        FULL_VIDEO="$FILE"
+        echo "Movie already downloaded : $FULL_VIDEO"
+        break
+    fi
+done
+
+# --- Download if not available ---
+if [ "$USE_EXISTING_STREAM" = false ]; then
+    FULL_VIDEO="$STREAM_DIR/${NORMALIZED_NAME}_(${VIDEO_ID}).mp4"
+    echo "Downloading stream..."
+    # Ensure -o output path is correctly formed from validated NORMALIZED_NAME and VIDEO_ID
+    yt-dlp -f best -o "$FULL_VIDEO" "$CANONICAL_URL"
+fi
+
+# --- Generate clips ---
+clip_index=1
+while [ -f "$MOVIE_DIR/${NORMALIZED_NAME}${clip_index}.mp4" ]; do
+    ((clip_index++))
+done
+
+chunk_pos=0
+
+for ((clip=1; clip<=CLIPS; clip++)); do
+    CHUNKS=${CHUNKS_PER_CLIP[clip-1]}
+    CLIP_TMP_DIR="$TMP_DIR/clip${clip}"
+    mkdir -p "$CLIP_TMP_DIR"
+    CHUNK_FILES=()
+
+    for ((c=0; c<CHUNKS; c++)); do
+        START_TIME=${CHUNKS_STARTS[chunk_pos]}
+        END_TIME=${CHUNKS_ENDS[chunk_pos]}
+        ((chunk_pos++))
+
+        OUTPUT_CHUNK="$CLIP_TMP_DIR/chunk$((c+1)).mp4"
+        echo "Cutting video $clip part $((c+1)) from $START_TIME to $END_TIME"
+        # Ensure arguments to ffmpeg are clean
+        ffmpeg -hide_banner -loglevel error -ss "$START_TIME" -to "$END_TIME" -i "$FULL_VIDEO" \
+            -c:v copy -c:a copy "$OUTPUT_CHUNK"
+        CHUNK_FILES+=("$OUTPUT_CHUNK")
+    done
+
+    if [ "$CHUNKS" -gt 1 ]; then
+        CONCAT_LIST="$CLIP_TMP_DIR/concat.txt"
+        > "$CONCAT_LIST"
+        for f in "${CHUNK_FILES[@]}"; do
+            echo "file '$f'" >> "$CONCAT_LIST"
+        done
+        FINAL_OUTPUT="$MOVIE_DIR/${NORMALIZED_NAME}${clip_index}.mp4"
+        ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i "$CONCAT_LIST" -c copy "$FINAL_OUTPUT"
+    else
+        FINAL_OUTPUT="$MOVIE_DIR/${NORMALIZED_NAME}${clip_index}.mp4"
+        mv "${CHUNK_FILES[0]}" "$FINAL_OUTPUT"
+    fi
+
+    echo "Video saved: $FINAL_OUTPUT"
+    ((clip_index++))
+done
+
+rm -rf "$TMP_DIR"
+
+green "✅ All clips successfully prepared! Videos are here: $MOVIE_DIR"
